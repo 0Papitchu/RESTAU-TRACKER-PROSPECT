@@ -1,0 +1,6 @@
+{
+  "name": "RestoRadar",
+  "description": "Détectez les restaurants à fort potentiel sans site web ni application à proximité via Google Maps et préparez vos dossiers de prospection.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
