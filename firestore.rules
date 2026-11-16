@@ -1,0 +1,166 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidOptionalString(data, key, maxLen) {
+      return !(key in data) || (data[key] is string && data[key].size() <= maxLen);
+    }
+
+    function isValidProspectKit(kit) {
+      return kit is map
+        && kit.keys().hasAll([
+          'opportunityDiagnosis',
+          'recommendedSolutionTitle',
+          'recommendedFeatures',
+          'estimatedImpact',
+          'bestContactWindow',
+          'emailSubject',
+          'emailBody',
+          'whatsappMessage',
+          'callScript',
+          'objections'
+        ])
+        && kit.keys().hasOnly([
+          'opportunityDiagnosis',
+          'recommendedSolutionTitle',
+          'recommendedFeatures',
+          'estimatedImpact',
+          'bestContactWindow',
+          'emailSubject',
+          'emailBody',
+          'whatsappMessage',
+          'callScript',
+          'objections'
+        ])
+        && kit.opportunityDiagnosis is string && kit.opportunityDiagnosis.size() <= 2000
+        && kit.recommendedSolutionTitle is string && kit.recommendedSolutionTitle.size() <= 200
+        && kit.recommendedFeatures is list && kit.recommendedFeatures.size() <= 8
+        && (kit.recommendedFeatures.size() == 0 || kit.recommendedFeatures[0] is string)
+        && kit.estimatedImpact is string && kit.estimatedImpact.size() <= 1500
+        && kit.bestContactWindow is string && kit.bestContactWindow.size() <= 500
+        && kit.emailSubject is string && kit.emailSubject.size() <= 300
+        && kit.emailBody is string && kit.emailBody.size() <= 5000
+        && kit.whatsappMessage is string && kit.whatsappMessage.size() <= 1500
+        && kit.callScript is string && kit.callScript.size() <= 3000
+        && kit.objections is list && kit.objections.size() <= 6
+        && (kit.objections.size() == 0 || kit.objections[0] is map);
+    }
+
+    function isValidProspect(data) {
+      return data.keys().hasAll([
+          'ownerId',
+          'placeId',
+          'displayName',
+          'formattedAddress',
+          'userRatingCount',
+          'websiteStatus',
+          'status',
+          'notes',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId',
+          'placeId',
+          'displayName',
+          'formattedAddress',
+          'primaryTypeDisplayName',
+          'rating',
+          'userRatingCount',
+          'websiteStatus',
+          'nationalPhoneNumber',
+          'googleMapsURI',
+          'recipientEmail',
+          'status',
+          'notes',
+          'lastGmailSentAt',
+          'lastGmailThreadId',
+          'lastTaskCreatedAt',
+          'lastTaskTitle',
+          'kit',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.ownerId is string && data.ownerId.size() <= 128 && data.ownerId == request.auth.uid
+        && isValidId(data.placeId)
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 200
+        && data.formattedAddress is string && data.formattedAddress.size() <= 400
+        && isValidOptionalString(data, 'primaryTypeDisplayName', 120)
+        && (!('rating' in data) || data.rating == null || (data.rating is number && data.rating >= 0 && data.rating <= 5))
+        && data.userRatingCount is number && data.userRatingCount >= 0 && data.userRatingCount <= 1000000
+        && data.websiteStatus is string && data.websiteStatus in ['none', 'social_or_aggregator', 'own_website']
+        && isValidOptionalString(data, 'nationalPhoneNumber', 40)
+        && isValidOptionalString(data, 'googleMapsURI', 500)
+        && isValidOptionalString(data, 'recipientEmail', 200)
+        && data.status is string && data.status in ['a_contacter', 'contacte', 'rdv_pris', 'archive']
+        && data.notes is string && data.notes.size() <= 4000
+        && isValidOptionalString(data, 'lastGmailSentAt', 64)
+        && isValidOptionalString(data, 'lastGmailThreadId', 128)
+        && isValidOptionalString(data, 'lastTaskCreatedAt', 64)
+        && isValidOptionalString(data, 'lastTaskTitle', 200)
+        && (!('kit' in data) || isValidProspectKit(data.kit))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    match /prospects/{prospectId} {
+      allow get: if isSignedIn()
+        && isValidId(prospectId)
+        && existing().ownerId == request.auth.uid;
+
+      allow list: if isSignedIn()
+        && existing().ownerId == request.auth.uid;
+
+      allow create: if isVerifiedUser()
+        && isValidId(prospectId)
+        && isValidProspect(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(prospectId)
+        && isValidProspect(incoming())
+        && existing().ownerId == request.auth.uid
+        && incoming().ownerId == existing().ownerId
+        && incoming().placeId == existing().placeId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'recipientEmail', 'updatedAt']) ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['kit', 'updatedAt']) ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'recipientEmail', 'lastGmailSentAt', 'lastGmailThreadId', 'updatedAt']) ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['lastTaskCreatedAt', 'lastTaskTitle', 'updatedAt']) ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'formattedAddress', 'primaryTypeDisplayName', 'rating', 'userRatingCount', 'websiteStatus', 'nationalPhoneNumber', 'googleMapsURI', 'updatedAt'])
+        );
+
+      allow delete: if isVerifiedUser()
+        && isValidId(prospectId)
+        && existing().ownerId == request.auth.uid;
+    }
+  }
+}

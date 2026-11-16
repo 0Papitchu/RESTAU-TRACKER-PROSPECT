@@ -1,0 +1,131 @@
+{
+  "entities": {
+    "Prospect": {
+      "title": "Prospect",
+      "description": "Restaurant prospect saved in a user's RestoRadar CRM pipeline with optional AI dossier and Gmail/Tasks outreach tracking.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the user who owns this prospect record.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "placeId": {
+          "type": "string",
+          "description": "Google Places ID for the restaurant.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Restaurant display name.",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "formattedAddress": {
+          "type": "string",
+          "description": "Formatted street address.",
+          "maxLength": 400
+        },
+        "primaryTypeDisplayName": {
+          "type": "string",
+          "description": "Localized cuisine or establishment category.",
+          "maxLength": 120
+        },
+        "rating": {
+          "type": "number",
+          "description": "Google Maps rating between 0 and 5."
+        },
+        "userRatingCount": {
+          "type": "number",
+          "description": "Total Google Maps review count."
+        },
+        "websiteStatus": {
+          "type": "string",
+          "description": "Digital presence classification.",
+          "enum": ["none", "social_or_aggregator", "own_website"]
+        },
+        "nationalPhoneNumber": {
+          "type": "string",
+          "description": "National phone number of the establishment.",
+          "maxLength": 40
+        },
+        "googleMapsURI": {
+          "type": "string",
+          "description": "Google Maps URI for the place.",
+          "maxLength": 500
+        },
+        "recipientEmail": {
+          "type": "string",
+          "description": "Contact email address entered by the prospector.",
+          "maxLength": 200
+        },
+        "status": {
+          "type": "string",
+          "description": "CRM pipeline status.",
+          "enum": ["a_contacter", "contacte", "rdv_pris", "archive"]
+        },
+        "notes": {
+          "type": "string",
+          "description": "Personal prospecting notes.",
+          "maxLength": 4000
+        },
+        "lastGmailSentAt": {
+          "type": "string",
+          "description": "ISO timestamp of last email sent via Gmail API.",
+          "maxLength": 64
+        },
+        "lastGmailThreadId": {
+          "type": "string",
+          "description": "Gmail thread ID of last sent prospecting email.",
+          "maxLength": 128
+        },
+        "lastTaskCreatedAt": {
+          "type": "string",
+          "description": "ISO timestamp of last Google Task follow-up created.",
+          "maxLength": 64
+        },
+        "lastTaskTitle": {
+          "type": "string",
+          "description": "Title of last Google Task follow-up created.",
+          "maxLength": 200
+        },
+        "kit": {
+          "type": "object",
+          "description": "Structured AI-generated prospecting dossier."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server last update timestamp."
+        }
+      },
+      "required": [
+        "ownerId",
+        "placeId",
+        "displayName",
+        "formattedAddress",
+        "userRatingCount",
+        "websiteStatus",
+        "status",
+        "notes",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/prospects/{prospectId}": {
+      "schema": {
+        "$ref": "#/entities/Prospect"
+      },
+      "description": "Private prospecting shortlist records owned per authenticated user."
+    }
+  }
+}

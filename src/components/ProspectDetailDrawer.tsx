@@ -7,6 +7,7 @@ import {
   ExternalLink,
   Loader2,
   MapPin,
+  MessageCircle,
   Phone,
   Sparkles,
   X,
@@ -20,6 +21,7 @@ import {
   formatPriceLevel,
 } from "../types/prospect";
 import { ProspectEmailGenerator } from "./ProspectEmailGenerator";
+import { ProspectTasksFollowUp } from "./ProspectTasksFollowUp";
 
 interface ProspectDetailDrawerProps {
   lead: RestaurantLead | null;
@@ -30,6 +32,17 @@ interface ProspectDetailDrawerProps {
   onSaveKit: (lead: RestaurantLead, kit: ProspectKit) => void;
   onUpdateStatus: (placeId: string, status: PipelineStatus) => void;
   onUpdateNotes: (placeId: string, notes: string) => void;
+  onSaveRecipientEmail?: (lead: RestaurantLead, email: string) => void;
+  onRecordGmailSent?: (
+    lead: RestaurantLead,
+    info: { recipientEmail: string; threadId?: string; sentAt: string },
+    kit?: ProspectKit
+  ) => void;
+  onRecordTaskCreated?: (
+    lead: RestaurantLead,
+    info: { taskTitle: string; createdAt: string },
+    kit?: ProspectKit
+  ) => void;
 }
 
 const OFFER_ANGLES = [
@@ -48,6 +61,9 @@ export function ProspectDetailDrawer({
   onSaveKit,
   onUpdateStatus,
   onUpdateNotes,
+  onSaveRecipientEmail,
+  onRecordGmailSent,
+  onRecordTaskCreated,
 }: ProspectDetailDrawerProps) {
   const [offerAngle, setOfferAngle] = useState(OFFER_ANGLES[0]);
   const [customAngle, setCustomAngle] = useState("");
@@ -328,13 +344,37 @@ export function ProspectDetailDrawer({
           )}
         </div>
 
-        {/* Personalized Email Template Generator */}
+        {/* Personalized Email Template Generator & Gmail Direct Send */}
         <ProspectEmailGenerator
           lead={lead}
           kit={kit}
+          savedEntry={savedEntry}
           isSaved={Boolean(savedEntry)}
           savedStatus={savedEntry?.status}
           onMarkContacted={handleMarkContacted}
+          onRecipientEmailSaved={(email) =>
+            onSaveRecipientEmail?.(lead, email)
+          }
+          onGmailSent={(info) => {
+            if (onRecordGmailSent) {
+              onRecordGmailSent(lead, info, kit ?? undefined);
+            } else {
+              handleMarkContacted();
+            }
+          }}
+        />
+
+        {/* Google Tasks Follow-up Scheduler */}
+        <ProspectTasksFollowUp
+          lead={lead}
+          savedEntry={savedEntry}
+          onTaskCreated={(taskTitle, createdAt) => {
+            onRecordTaskCreated?.(
+              lead,
+              { taskTitle, createdAt },
+              kit ?? undefined
+            );
+          }}
         />
 
         {/* AI Prospection Kit Preparation */}
@@ -520,26 +560,39 @@ export function ProspectDetailDrawer({
                     </div>
 
                     <div className="space-y-1.5 pt-2 border-t border-slate-100">
-                      <div className="flex items-center justify-between">
+                      <div className="flex items-center justify-between gap-2">
                         <span className="text-xs font-semibold text-slate-500">
                           Message WhatsApp / SMS
                         </span>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            void handleCopy(kit.whatsappMessage, "whatsapp")
-                          }
-                          className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700 hover:text-emerald-800"
-                        >
-                          {copiedField === "whatsapp" ? (
-                            <Check className="w-3.5 h-3.5" />
-                          ) : (
-                            <Copy className="w-3.5 h-3.5" />
+                        <div className="flex items-center gap-3">
+                          {lead.internationalPhoneNumber && (
+                            <a
+                              href={`https://wa.me/${lead.internationalPhoneNumber.replace(/[^0-9]/g, "")}?text=${encodeURIComponent(kit.whatsappMessage)}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700 hover:text-emerald-800"
+                            >
+                              <MessageCircle className="w-3.5 h-3.5" />
+                              <span>Ouvrir WhatsApp</span>
+                            </a>
                           )}
-                          <span>
-                            {copiedField === "whatsapp" ? "Copié" : "Copier"}
-                          </span>
-                        </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void handleCopy(kit.whatsappMessage, "whatsapp")
+                            }
+                            className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700 hover:text-emerald-800"
+                          >
+                            {copiedField === "whatsapp" ? (
+                              <Check className="w-3.5 h-3.5" />
+                            ) : (
+                              <Copy className="w-3.5 h-3.5" />
+                            )}
+                            <span>
+                              {copiedField === "whatsapp" ? "Copié" : "Copier"}
+                            </span>
+                          </button>
+                        </div>
                       </div>
                       <p className="text-xs text-slate-700 bg-slate-50 p-3 rounded border border-slate-200 leading-relaxed whitespace-pre-wrap">
                         {kit.whatsappMessage}

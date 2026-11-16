@@ -1,4 +1,6 @@
-import { LocateFixed, Loader2 } from "lucide-react";
+import { LocateFixed, Loader2, LogOut, Mail } from "lucide-react";
+import { useGoogleWorkspaceAuth } from "../contexts/GoogleWorkspaceAuthContext";
+import { GoogleSignInButton } from "./GoogleSignInButton";
 
 export type ActiveTab =
   | "radar"
@@ -24,6 +26,10 @@ export function TopBar({
   shortlistCount,
   noWebsiteCount,
 }: TopBarProps) {
+  const { user, accessToken, needsAuth, isSigningIn, signIn, signOut } =
+    useGoogleWorkspaceAuth();
+  const isGoogleReady = Boolean(accessToken) && !needsAuth;
+
   const navItems: Array<{ id: ActiveTab; label: string }> = [
     { id: "radar", label: "Carte & Radar" },
     {
@@ -78,7 +84,33 @@ export function TopBar({
           })}
         </nav>
 
-        <div className="flex items-center shrink-0">
+        <div className="flex items-center gap-2.5 shrink-0">
+          {isGoogleReady ? (
+            <div className="hidden lg:inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg max-w-[220px]">
+              <Mail className="w-3.5 h-3.5 text-emerald-700 shrink-0" aria-hidden="true" />
+              <span className="truncate" title={user?.email || "Gmail connecté"}>
+                {user?.email || "Gmail connecté"}
+              </span>
+              <button
+                type="button"
+                onClick={() => void signOut()}
+                aria-label="Déconnecter Google"
+                title="Déconnecter Google"
+                className="text-emerald-700 hover:text-slate-900 shrink-0"
+              >
+                <LogOut className="w-3.5 h-3.5" aria-hidden="true" />
+              </button>
+            </div>
+          ) : (
+            <div className="hidden lg:block">
+              <GoogleSignInButton
+                onClick={() => void signIn()}
+                disabled={isSigningIn}
+                className="!h-9 !text-xs"
+              />
+            </div>
+          )}
+
           <button
             type="button"
             onClick={onGeolocate}

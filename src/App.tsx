@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { APIProvider, useMapsLibrary } from "@vis.gl/react-google-maps";
 import { AlertCircle, Loader2 } from "lucide-react";
 import { TopBar, ActiveTab } from "./components/TopBar";
@@ -11,7 +11,20 @@ import {
   ShortlistView,
 } from "./components/ShortlistAndStrategyView";
 import { ZoneAnalyticsD3 } from "./components/ZoneAnalyticsD3";
+import {
+  GoogleWorkspaceAuthProvider,
+  useGoogleWorkspaceAuth,
+} from "./contexts/GoogleWorkspaceAuthContext";
 import { useNearbyRestaurants } from "./hooks/useNearbyRestaurants";
+import {
+  createProspectInFirestore,
+  deleteProspectInFirestore,
+  recordProspectGmailSentInFirestore,
+  recordProspectTaskCreatedInFirestore,
+  subscribeToUserProspects,
+  updateProspectDetailsInFirestore,
+  updateProspectKitInFirestore,
+} from "./services/firestoreService";
 import {
   PipelineStatus,
   PlaceCategoryFilter,
@@ -112,15 +125,39 @@ export default function App() {
           language="fr"
           region="FR"
         >
-          <Workspace />
+          <GoogleWorkspaceAuthProvider>
+            <Workspace />
+          </GoogleWorkspaceAuthProvider>
         </APIProvider>
       )}
     </div>
   );
 }
 
+function buildSavedEntryFromLead(
+  lead: RestaurantLead,
+  overrides?: Partial<SavedProspectEntry>
+): SavedProspectEntry {
+  return {
+    placeId: lead.id,
+    displayName: lead.displayName,
+    formattedAddress: lead.formattedAddress,
+    primaryTypeDisplayName: lead.primaryTypeDisplayName,
+    rating: lead.rating,
+    userRatingCount: lead.userRatingCount,
+    websiteStatus: lead.websiteStatus,
+    nationalPhoneNumber: lead.nationalPhoneNumber,
+    googleMapsURI: lead.googleMapsURI,
+    status: "a_contacter",
+    notes: "",
+    savedAt: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
 function Workspace() {
   const placesLib = useMapsLibrary("places");
+  const { user } = useGoogleWorkspaceAuth();
   const [activeTab, setActiveTab] = useState<ActiveTab>("radar");
   const [center, setCenter] = useState<{ lat: number; lng: number }>(
     DEFAULT_CENTER
@@ -144,6 +181,9 @@ function Workspace() {
   const [savedShortlist, setSavedShortlist] = useState<
     Record<string, SavedProspectEntry>
   >(() => loadSavedShortlist());
+  const [isCloudSynced, setIsCloudSynced] = useState(false);
+  const [cloudError, setCloudError] = useState<string | null>(null);
+  const migratedUidRef = useRef<string | null>(null);
 
   const {
     leads,
@@ -154,7 +194,7 @@ function Workspace() {
     loadPlaceDetails,
   } = useNearbyRestaurants();
 
-  // Persist shortlist in localStorage
+  // Persist shortlist in localStorage as offline/signed-out cache
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(savedShortlist));
@@ -162,6 +202,54 @@ function Workspace() {
       // Ignore quota errors on localStorage
     }
   }, [savedShortlist]);
+
+  // Real-time Firestore cloud sync when signed in
+  useEffect(() => {
+    if (!user?.uid) {
+      setIsCloudSynced(false);
+      setCloudError(null);
+      migratedUidRef.current = null;
+      return;
+    }
+
+    const uid = user.uid;
+    setCloudError(null);
+
+    const unsubscribe = subscribeToUserProspects(
+      uid,
+      (cloudMap) => {
+        setIsCloudSynced(true);
+        setCloudError(null);
+        setSavedShortlist(cloudMap);
+
+        // Migrate any localStorage-only prospects once on sign-in
+        if (migratedUidRef.current !== uid) {
+          migratedUidRef.current = uid;
+          const localEntries = loadSavedShortlist();
+          const missing = Object.values(localEntries).filter(
+            (entry) => !cloudMap[entry.placeId]
+          );
+          if (missing.length > 0) {
+            void Promise.all(
+              missing.map((entry) => createProspectInFirestore(uid, entry))
+            ).catch((err) => {
+              setCloudError(
+                err instanceof Error
+                  ? err.message
+                  : "Erreur de migration vers Firestore."
+              );
+            });
+          }
+        }
+      },
+      (err) => {
+        setIsCloudSynced(false);
+        setCloudError(err.message);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [user?.uid]);
 
   const runScan = useCallback(
     async (
@@ -254,60 +342,49 @@ function Workspace() {
 
   const handleToggleSave = useCallback(
     (lead: RestaurantLead, kit?: ProspectKit) => {
-      setSavedShortlist((prev) => {
-        const next = { ...prev };
-        if (next[lead.id]) {
+      const exists = Boolean(savedShortlist[lead.id]);
+      if (exists) {
+        setSavedShortlist((prev) => {
+          const next = { ...prev };
           delete next[lead.id];
-        } else {
-          next[lead.id] = {
-            placeId: lead.id,
-            displayName: lead.displayName,
-            formattedAddress: lead.formattedAddress,
-            primaryTypeDisplayName: lead.primaryTypeDisplayName,
-            rating: lead.rating,
-            userRatingCount: lead.userRatingCount,
-            websiteStatus: lead.websiteStatus,
-            nationalPhoneNumber: lead.nationalPhoneNumber,
-            googleMapsURI: lead.googleMapsURI,
-            status: "a_contacter",
-            notes: "",
-            savedAt: new Date().toISOString(),
-            kit,
-          };
+          return next;
+        });
+        if (user?.uid) {
+          void deleteProspectInFirestore(user.uid, lead.id).catch((err) =>
+            setCloudError(err instanceof Error ? err.message : String(err))
+          );
         }
-        return next;
-      });
+      } else {
+        const entry = buildSavedEntryFromLead(lead, { kit });
+        setSavedShortlist((prev) => ({ ...prev, [lead.id]: entry }));
+        if (user?.uid) {
+          void createProspectInFirestore(user.uid, entry).catch((err) =>
+            setCloudError(err instanceof Error ? err.message : String(err))
+          );
+        }
+      }
     },
-    []
+    [savedShortlist, user?.uid]
   );
 
   const handleSaveKit = useCallback(
     (lead: RestaurantLead, kit: ProspectKit) => {
-      setSavedShortlist((prev) => {
-        const existing = prev[lead.id];
-        return {
-          ...prev,
-          [lead.id]: existing
-            ? { ...existing, kit }
-            : {
-                placeId: lead.id,
-                displayName: lead.displayName,
-                formattedAddress: lead.formattedAddress,
-                primaryTypeDisplayName: lead.primaryTypeDisplayName,
-                rating: lead.rating,
-                userRatingCount: lead.userRatingCount,
-                websiteStatus: lead.websiteStatus,
-                nationalPhoneNumber: lead.nationalPhoneNumber,
-                googleMapsURI: lead.googleMapsURI,
-                status: "a_contacter",
-                notes: "",
-                savedAt: new Date().toISOString(),
-                kit,
-              },
-        };
-      });
+      const existing = savedShortlist[lead.id];
+      const nextEntry = existing
+        ? { ...existing, kit }
+        : buildSavedEntryFromLead(lead, { kit });
+      setSavedShortlist((prev) => ({ ...prev, [lead.id]: nextEntry }));
+
+      if (user?.uid) {
+        const promise = existing
+          ? updateProspectKitInFirestore(user.uid, lead.id, kit)
+          : createProspectInFirestore(user.uid, nextEntry);
+        void promise.catch((err) =>
+          setCloudError(err instanceof Error ? err.message : String(err))
+        );
+      }
     },
-    []
+    [savedShortlist, user?.uid]
   );
 
   const handleUpdateStatus = useCallback(
@@ -317,25 +394,139 @@ function Workspace() {
         if (!item) return prev;
         return { ...prev, [placeId]: { ...item, status } };
       });
+      if (user?.uid && savedShortlist[placeId]) {
+        void updateProspectDetailsInFirestore(user.uid, placeId, {
+          status,
+        }).catch((err) =>
+          setCloudError(err instanceof Error ? err.message : String(err))
+        );
+      }
     },
-    []
+    [savedShortlist, user?.uid]
   );
 
-  const handleUpdateNotes = useCallback((placeId: string, notes: string) => {
-    setSavedShortlist((prev) => {
-      const item = prev[placeId];
-      if (!item) return prev;
-      return { ...prev, [placeId]: { ...item, notes } };
-    });
-  }, []);
+  const handleUpdateNotes = useCallback(
+    (placeId: string, notes: string) => {
+      setSavedShortlist((prev) => {
+        const item = prev[placeId];
+        if (!item) return prev;
+        return { ...prev, [placeId]: { ...item, notes } };
+      });
+      if (user?.uid && savedShortlist[placeId]) {
+        void updateProspectDetailsInFirestore(user.uid, placeId, {
+          notes,
+        }).catch((err) =>
+          setCloudError(err instanceof Error ? err.message : String(err))
+        );
+      }
+    },
+    [savedShortlist, user?.uid]
+  );
 
-  const handleRemoveSaved = useCallback((placeId: string) => {
-    setSavedShortlist((prev) => {
-      const next = { ...prev };
-      delete next[placeId];
-      return next;
-    });
-  }, []);
+  const handleSaveRecipientEmail = useCallback(
+    (lead: RestaurantLead, email: string) => {
+      const existing = savedShortlist[lead.id];
+      if (!existing) return;
+      setSavedShortlist((prev) => ({
+        ...prev,
+        [lead.id]: { ...prev[lead.id], recipientEmail: email },
+      }));
+      if (user?.uid) {
+        void updateProspectDetailsInFirestore(user.uid, lead.id, {
+          recipientEmail: email,
+        }).catch((err) =>
+          setCloudError(err instanceof Error ? err.message : String(err))
+        );
+      }
+    },
+    [savedShortlist, user?.uid]
+  );
+
+  const handleRecordGmailSent = useCallback(
+    (
+      lead: RestaurantLead,
+      info: { recipientEmail: string; threadId?: string; sentAt: string },
+      kit?: ProspectKit
+    ) => {
+      const existing = savedShortlist[lead.id];
+      const nextEntry = existing
+        ? {
+            ...existing,
+            status: "contacte" as PipelineStatus,
+            recipientEmail: info.recipientEmail,
+            lastGmailSentAt: info.sentAt,
+            lastGmailThreadId: info.threadId ?? existing.lastGmailThreadId,
+          }
+        : buildSavedEntryFromLead(lead, {
+            status: "contacte",
+            recipientEmail: info.recipientEmail,
+            lastGmailSentAt: info.sentAt,
+            lastGmailThreadId: info.threadId,
+            kit,
+          });
+
+      setSavedShortlist((prev) => ({ ...prev, [lead.id]: nextEntry }));
+
+      if (user?.uid) {
+        const promise = existing
+          ? recordProspectGmailSentInFirestore(user.uid, lead.id, info)
+          : createProspectInFirestore(user.uid, nextEntry);
+        void promise.catch((err) =>
+          setCloudError(err instanceof Error ? err.message : String(err))
+        );
+      }
+    },
+    [savedShortlist, user?.uid]
+  );
+
+  const handleRecordTaskCreated = useCallback(
+    (
+      lead: RestaurantLead,
+      info: { taskTitle: string; createdAt: string },
+      kit?: ProspectKit
+    ) => {
+      const existing = savedShortlist[lead.id];
+      const nextEntry = existing
+        ? {
+            ...existing,
+            lastTaskTitle: info.taskTitle,
+            lastTaskCreatedAt: info.createdAt,
+          }
+        : buildSavedEntryFromLead(lead, {
+            lastTaskTitle: info.taskTitle,
+            lastTaskCreatedAt: info.createdAt,
+            kit,
+          });
+
+      setSavedShortlist((prev) => ({ ...prev, [lead.id]: nextEntry }));
+
+      if (user?.uid) {
+        const promise = existing
+          ? recordProspectTaskCreatedInFirestore(user.uid, lead.id, info)
+          : createProspectInFirestore(user.uid, nextEntry);
+        void promise.catch((err) =>
+          setCloudError(err instanceof Error ? err.message : String(err))
+        );
+      }
+    },
+    [savedShortlist, user?.uid]
+  );
+
+  const handleRemoveSaved = useCallback(
+    (placeId: string) => {
+      setSavedShortlist((prev) => {
+        const next = { ...prev };
+        delete next[placeId];
+        return next;
+      });
+      if (user?.uid) {
+        void deleteProspectInFirestore(user.uid, placeId).catch((err) =>
+          setCloudError(err instanceof Error ? err.message : String(err))
+        );
+      }
+    },
+    [user?.uid]
+  );
 
   // Compute filtered & sorted leads (No-website & high-activity first)
   const filteredLeads = useMemo(() => {
@@ -590,6 +781,8 @@ function Workspace() {
         <main className="flex-1">
           <ShortlistView
             entries={savedEntriesList}
+            isCloudSynced={isCloudSynced}
+            cloudError={cloudError}
             onUpdateStatus={handleUpdateStatus}
             onRemoveEntry={handleRemoveSaved}
             onOpenFromSaved={(placeId) => {
@@ -632,6 +825,9 @@ function Workspace() {
           onSaveKit={handleSaveKit}
           onUpdateStatus={handleUpdateStatus}
           onUpdateNotes={handleUpdateNotes}
+          onSaveRecipientEmail={handleSaveRecipientEmail}
+          onRecordGmailSent={handleRecordGmailSent}
+          onRecordTaskCreated={handleRecordTaskCreated}
         />
       )}
     </>

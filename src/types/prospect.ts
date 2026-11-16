@@ -100,9 +100,15 @@ export interface SavedProspectEntry {
   websiteStatus: WebsiteStatus;
   nationalPhoneNumber: string | null;
   googleMapsURI: string | null;
+  recipientEmail?: string;
   status: PipelineStatus;
   notes: string;
   savedAt: string;
+  updatedAt?: string;
+  lastGmailSentAt?: string;
+  lastGmailThreadId?: string;
+  lastTaskCreatedAt?: string;
+  lastTaskTitle?: string;
   kit?: ProspectKit;
 }
 

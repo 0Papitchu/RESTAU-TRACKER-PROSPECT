@@ -1,14 +1,35 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  AlertCircle,
   Check,
   CheckCircle2,
   Copy,
+  FileText,
+  Loader2,
+  LogOut,
   Mail,
+  RefreshCw,
   RotateCcw,
+  Send,
   SlidersHorizontal,
   Sparkles,
+  X,
 } from "lucide-react";
-import { ProspectKit, RestaurantLead } from "../types/prospect";
+import {
+  ProspectKit,
+  RestaurantLead,
+  SavedProspectEntry,
+} from "../types/prospect";
+import { useGoogleWorkspaceAuth } from "../contexts/GoogleWorkspaceAuthContext";
+import { GoogleSignInButton } from "./GoogleSignInButton";
+import {
+  GmailAuthExpiredError,
+  GmailReplyStatus,
+  checkProspectGmailReplies,
+  createProspectDraftInGmail,
+  isValidEmailAddress,
+  sendProspectEmailViaGmail,
+} from "../services/gmailService";
 
 export type EmailTemplateId =
   | "site_vitrine"
@@ -25,6 +46,7 @@ interface SenderProfile {
 }
 
 const SENDER_STORAGE_KEY = "restoradar_sender_profile_v1";
+const RECIPIENT_EMAILS_STORAGE_KEY = "restoradar_prospect_emails_v1";
 
 const DEFAULT_SENDER: SenderProfile = {
   senderName: "",
@@ -47,9 +69,34 @@ function loadSenderProfile(): SenderProfile {
   }
 }
 
+function loadSavedRecipientEmail(placeId: string): string {
+  try {
+    const raw = localStorage.getItem(RECIPIENT_EMAILS_STORAGE_KEY);
+    if (!raw) return "";
+    const map = JSON.parse(raw) as Record<string, string>;
+    return map[placeId] ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function saveRecipientEmail(placeId: string, email: string): void {
+  try {
+    const raw = localStorage.getItem(RECIPIENT_EMAILS_STORAGE_KEY);
+    const map: Record<string, string> = raw ? JSON.parse(raw) : {};
+    if (email.trim()) {
+      map[placeId] = email.trim();
+    } else {
+      delete map[placeId];
+    }
+    localStorage.setItem(RECIPIENT_EMAILS_STORAGE_KEY, JSON.stringify(map));
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
 export function extractCityFromAddress(formattedAddress: string): string {
   if (!formattedAddress) return "";
-  // Match French / European postal code + city, e.g. "75011 Paris" or "69002 Lyon"
   const postalCityMatch = formattedAddress.match(
     /\b\d{4,5}\s+([^,]+?)(?:,|$)/
   );
@@ -61,7 +108,6 @@ export function extractCityFromAddress(formattedAddress: string): string {
     .map((p) => p.trim())
     .filter(Boolean);
   if (parts.length >= 2) {
-    // Take penultimate segment if last looks like a country name
     const last = parts[parts.length - 1];
     if (
       /^(france|belgique|suisse|canada|luxembourg|espagne|italie|allemagne)$/i.test(
@@ -283,7 +329,6 @@ ${signature}`;
     return { subject, body };
   }
 
-  // approche_courte
   const subject = `Question rapide pour ${name}${cityPhrase}`;
   const shortGap =
     lead.websiteStatus === "none"
@@ -307,18 +352,39 @@ ${signature}`;
 interface ProspectEmailGeneratorProps {
   lead: RestaurantLead;
   kit: ProspectKit | null;
+  savedEntry?: SavedProspectEntry;
   isSaved: boolean;
   savedStatus?: string;
   onMarkContacted: () => void;
+  onRecipientEmailSaved?: (email: string) => void;
+  onGmailSent?: (info: {
+    recipientEmail: string;
+    threadId?: string;
+    sentAt: string;
+  }) => void;
 }
 
 export function ProspectEmailGenerator({
   lead,
   kit,
+  savedEntry,
   isSaved,
   savedStatus,
   onMarkContacted,
+  onRecipientEmailSaved,
+  onGmailSent,
 }: ProspectEmailGeneratorProps) {
+  const {
+    user,
+    accessToken,
+    needsAuth,
+    isSigningIn,
+    authError,
+    signIn,
+    signOut,
+    invalidateToken,
+  } = useGoogleWorkspaceAuth();
+
   const [templateId, setTemplateId] = useState<EmailTemplateId>(() =>
     pickDefaultTemplate(lead)
   );
@@ -329,10 +395,37 @@ export function ProspectEmailGenerator({
   const [showSenderSettings, setShowSenderSettings] = useState(
     () => !loadSenderProfile().senderName
   );
+  const [recipientEmail, setRecipientEmail] = useState<string>(
+    () => savedEntry?.recipientEmail || loadSavedRecipientEmail(lead.id)
+  );
   const [subject, setSubject] = useState("");
   const [body, setBody] = useState("");
   const [isDirty, setIsDirty] = useState(false);
   const [copied, setCopied] = useState(false);
+
+  // Gmail sending & reply tracking state
+  const [pendingAction, setPendingAction] = useState<"send" | "draft" | null>(
+    null
+  );
+  const [isSendingGmail, setIsSendingGmail] = useState(false);
+  const [gmailError, setGmailError] = useState<string | null>(null);
+  const [gmailSuccess, setGmailSuccess] = useState<{
+    type: "send" | "draft";
+    to?: string;
+    timestamp: string;
+  } | null>(null);
+  const [replyStatus, setReplyStatus] = useState<GmailReplyStatus | null>(null);
+  const [isCheckingReplies, setIsCheckingReplies] = useState(false);
+
+  // Pre-fill sender name from connected Google account if empty
+  useEffect(() => {
+    if (user?.displayName && !sender.senderName) {
+      setSender((prev) => ({
+        ...prev,
+        senderName: prev.senderName || user.displayName || "",
+      }));
+    }
+  }, [user?.displayName, sender.senderName]);
 
   // Persist sender profile in localStorage
   useEffect(() => {
@@ -343,11 +436,18 @@ export function ProspectEmailGenerator({
     }
   }, [sender]);
 
-  // Reset template choice & dirty state when switching to a different restaurant
+  // Reset template, recipient email, and Gmail feedback when switching restaurant
   useEffect(() => {
     const recommended = pickDefaultTemplate(lead);
     setTemplateId(recommended);
     setIsDirty(false);
+    setRecipientEmail(
+      savedEntry?.recipientEmail || loadSavedRecipientEmail(lead.id)
+    );
+    setPendingAction(null);
+    setGmailError(null);
+    setGmailSuccess(null);
+    setReplyStatus(null);
     const built = buildPersonalizedEmail({
       lead,
       templateId: recommended,
@@ -382,6 +482,15 @@ export function ProspectEmailGenerator({
     sender,
     isDirty,
   ]);
+
+  const handleRecipientChange = (nextEmail: string) => {
+    setRecipientEmail(nextEmail);
+    saveRecipientEmail(lead.id, nextEmail);
+    setGmailError(null);
+    if (isSaved && onRecipientEmailSaved) {
+      onRecipientEmailSaved(nextEmail.trim());
+    }
+  };
 
   const handleSelectTemplate = (nextId: EmailTemplateId) => {
     setTemplateId(nextId);
@@ -438,9 +547,135 @@ export function ProspectEmailGenerator({
     }
   };
 
+  const handleRequestGmailSend = () => {
+    setGmailError(null);
+    if (!isValidEmailAddress(recipientEmail)) {
+      setGmailError(
+        "Renseignez une adresse e-mail destinataire valide pour ce restaurant avant l'envoi."
+      );
+      return;
+    }
+    if (!subject.trim() || !body.trim()) {
+      setGmailError("L'objet et le corps de l'e-mail sont requis.");
+      return;
+    }
+    setPendingAction("send");
+  };
+
+  const handleRequestGmailDraft = () => {
+    setGmailError(null);
+    if (recipientEmail.trim() && !isValidEmailAddress(recipientEmail)) {
+      setGmailError("L'adresse e-mail destinataire saisie n'est pas valide.");
+      return;
+    }
+    if (!subject.trim() || !body.trim()) {
+      setGmailError("L'objet et le corps du message sont requis.");
+      return;
+    }
+    setPendingAction("draft");
+  };
+
+  const handleConfirmGmailAction = async () => {
+    if (!pendingAction || !accessToken) return;
+    setIsSendingGmail(true);
+    setGmailError(null);
+
+    try {
+      const nowLabel = new Date().toLocaleTimeString("fr-FR", {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+
+      if (pendingAction === "send") {
+        const sent = await sendProspectEmailViaGmail({
+          accessToken,
+          to: recipientEmail.trim(),
+          subject,
+          body,
+          fromEmail: user?.email,
+        });
+        setGmailSuccess({
+          type: "send",
+          to: recipientEmail.trim(),
+          timestamp: nowLabel,
+        });
+        if (onGmailSent) {
+          onGmailSent({
+            recipientEmail: recipientEmail.trim(),
+            threadId: sent.threadId,
+            sentAt: new Date().toISOString(),
+          });
+        } else {
+          onMarkContacted();
+        }
+      } else {
+        await createProspectDraftInGmail({
+          accessToken,
+          to: recipientEmail.trim() || undefined,
+          subject,
+          body,
+          fromEmail: user?.email,
+        });
+        setGmailSuccess({
+          type: "draft",
+          to: recipientEmail.trim() || undefined,
+          timestamp: nowLabel,
+        });
+      }
+      setPendingAction(null);
+    } catch (err) {
+      if (err instanceof GmailAuthExpiredError) {
+        invalidateToken();
+      }
+      setPendingAction(null);
+      setGmailError(
+        err instanceof Error
+          ? err.message
+          : "Impossible d'exécuter l'opération Gmail."
+      );
+    } finally {
+      setIsSendingGmail(false);
+    }
+  };
+
+  const handleCheckReplies = async () => {
+    if (!accessToken) return;
+    if (!isValidEmailAddress(recipientEmail) && !savedEntry?.lastGmailThreadId) {
+      setGmailError(
+        "Renseignez d'abord l'adresse e-mail du restaurant pour rechercher ses réponses."
+      );
+      return;
+    }
+    setIsCheckingReplies(true);
+    setGmailError(null);
+    try {
+      const result = await checkProspectGmailReplies({
+        accessToken,
+        recipientEmail: recipientEmail.trim() || undefined,
+        threadId: savedEntry?.lastGmailThreadId,
+        userEmail: user?.email,
+      });
+      setReplyStatus(result);
+    } catch (err) {
+      if (err instanceof GmailAuthExpiredError) {
+        invalidateToken();
+      }
+      setGmailError(
+        err instanceof Error
+          ? err.message
+          : "Impossible de vérifier les réponses Gmail."
+      );
+    } finally {
+      setIsCheckingReplies(false);
+    }
+  };
+
   const mailtoHref = useMemo(() => {
-    return `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-  }, [subject, body]);
+    const recipient = isValidEmailAddress(recipientEmail)
+      ? recipientEmail.trim()
+      : "";
+    return `mailto:${encodeURIComponent(recipient)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  }, [recipientEmail, subject, body]);
 
   const city = extractCityFromAddress(lead.formattedAddress);
   const injectedSignals = useMemo(() => {
@@ -465,20 +700,21 @@ export function ProspectEmailGenerator({
   }, [lead, city]);
 
   const alreadyContacted = isSaved && savedStatus === "contacte";
+  const hasGmailToken = Boolean(accessToken) && !needsAuth;
 
   return (
     <section
-      aria-label="Générateur d'e-mails de prospection"
+      aria-label="Générateur et envoi d'e-mails de prospection"
       className="border-t border-slate-200 pt-5 space-y-3.5"
     >
       <div className="flex items-start justify-between gap-3">
         <div>
           <h3 className="font-display text-base font-bold text-slate-900">
-            Générateur d&apos;e-mail de prospection
+            E-mail de prospection &amp; Envoi Gmail
           </h3>
           <p className="text-xs text-slate-600 mt-0.5">
-            Modèles pré-remplis instantanément avec les données Google Maps de
-            l&apos;établissement.
+            Modèles pré-remplis avec les données Google Maps, envoyables
+            directement depuis votre compte Gmail.
           </p>
         </div>
 
@@ -496,7 +732,7 @@ export function ProspectEmailGenerator({
         </button>
       </div>
 
-      {/* Real data signals injected into template (plain hairline strip, no pills) */}
+      {/* Real data signals injected into template */}
       <div className="text-[11px] text-slate-500 tabular-nums leading-relaxed">
         <span className="font-semibold text-slate-700">Données injectées :</span>{" "}
         {injectedSignals.join(" · ")}
@@ -622,8 +858,31 @@ export function ProspectEmailGenerator({
         </div>
       </div>
 
-      {/* Editable Subject & Body */}
-      <div className="space-y-2">
+      {/* Recipient, Subject & Body */}
+      <div className="space-y-2.5">
+        <div>
+          <label
+            htmlFor="prospect-recipient-email"
+            className="block text-[11px] font-semibold text-slate-500 mb-1"
+          >
+            Destinataire (e-mail de {lead.displayName})
+          </label>
+          <input
+            id="prospect-recipient-email"
+            type="email"
+            value={recipientEmail}
+            onChange={(e) => handleRecipientChange(e.target.value)}
+            placeholder="contact@restaurant.fr"
+            className="w-full px-3 py-2 text-xs bg-white border border-slate-200 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-600"
+          />
+          {!recipientEmail && lead.nationalPhoneNumber && (
+            <p className="text-[11px] text-slate-500 mt-1">
+              Google Maps ne fournit pas l&apos;adresse e-mail : récupérez-la
+              sur leur page ou demandez-la au {lead.nationalPhoneNumber}.
+            </p>
+          )}
+        </div>
+
         <div>
           <label
             htmlFor="prospect-email-subject"
@@ -659,7 +918,7 @@ export function ProspectEmailGenerator({
           </div>
           <textarea
             id="prospect-email-body"
-            rows={9}
+            rows={8}
             value={body}
             onChange={(e) => {
               setBody(e.target.value);
@@ -670,7 +929,144 @@ export function ProspectEmailGenerator({
         </div>
       </div>
 
-      {/* Action Buttons */}
+      {/* Gmail Direct Send Service Block */}
+      <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg space-y-3">
+        <div className="flex items-center justify-between gap-2">
+          <div className="text-xs font-semibold text-slate-800">
+            Envoi direct via Gmail
+          </div>
+          {hasGmailToken && user?.email && (
+            <div className="flex items-center gap-2 text-[11px] text-slate-600 min-w-0">
+              <span className="truncate">{user.email}</span>
+              <button
+                type="button"
+                onClick={() => void signOut()}
+                title="Déconnecter le compte Google"
+                className="inline-flex items-center gap-1 text-slate-500 hover:text-slate-900 whitespace-nowrap shrink-0"
+              >
+                <LogOut className="w-3 h-3" aria-hidden="true" />
+                <span>Déconnecter</span>
+              </button>
+            </div>
+          )}
+        </div>
+
+        {!hasGmailToken ? (
+          <div className="space-y-2.5">
+            <p className="text-xs text-slate-600 leading-relaxed">
+              {user
+                ? "Reconnectez votre session Google pour autoriser l'envoi direct depuis votre boîte Gmail."
+                : "Connectez votre compte Google pour envoyer cet e-mail ou créer un brouillon directement dans Gmail."}
+            </p>
+            <GoogleSignInButton
+              onClick={() => void signIn()}
+              disabled={isSigningIn}
+            />
+            {authError && (
+              <div className="flex items-start gap-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg p-2.5">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>{authError}</span>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={handleRequestGmailSend}
+              className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors whitespace-nowrap shrink-0"
+            >
+              <Send className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>Envoyer via Gmail</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleRequestGmailDraft}
+              className="inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-800 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0"
+            >
+              <FileText className="w-3.5 h-3.5 text-slate-600" aria-hidden="true" />
+              <span>Brouillon Gmail</span>
+            </button>
+
+            {(isValidEmailAddress(recipientEmail) ||
+              Boolean(savedEntry?.lastGmailThreadId)) && (
+              <button
+                type="button"
+                onClick={() => void handleCheckReplies()}
+                disabled={isCheckingReplies}
+                className="inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0"
+              >
+                <RefreshCw
+                  className={`w-3.5 h-3.5 ${isCheckingReplies ? "animate-spin" : ""}`}
+                  aria-hidden="true"
+                />
+                <span>
+                  {isCheckingReplies ? "Vérification…" : "Vérifier réponse"}
+                </span>
+              </button>
+            )}
+          </div>
+        )}
+
+        {savedEntry?.lastGmailSentAt && (
+          <div className="text-[11px] text-slate-500 tabular-nums">
+            Dernier envoi enregistré le{" "}
+            {new Date(savedEntry.lastGmailSentAt).toLocaleString("fr-FR", {
+              dateStyle: "short",
+              timeStyle: "short",
+            })}
+          </div>
+        )}
+
+        {replyStatus && (
+          <div
+            className={`text-xs rounded-lg p-2.5 border ${
+              replyStatus.hasReply
+                ? "bg-emerald-50 border-emerald-200 text-emerald-900"
+                : "bg-white border-slate-200 text-slate-600"
+            }`}
+          >
+            {replyStatus.hasReply ? (
+              <div className="space-y-1">
+                <div className="font-semibold text-emerald-800">
+                  Réponse reçue de {replyStatus.latestReplyFrom || recipientEmail}
+                  {replyStatus.latestReplyDate
+                    ? ` (${replyStatus.latestReplyDate})`
+                    : ""}
+                </div>
+                {replyStatus.latestReplySnippet && (
+                  <p className="text-[11px] text-emerald-800/90 leading-relaxed">
+                    « {replyStatus.latestReplySnippet} »
+                  </p>
+                )}
+              </div>
+            ) : (
+              <span>Aucune réponse détectée dans votre boîte Gmail pour le moment.</span>
+            )}
+          </div>
+        )}
+
+        {gmailError && (
+          <div className="flex items-start gap-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg p-2.5">
+            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+            <span>{gmailError}</span>
+          </div>
+        )}
+
+        {gmailSuccess && (
+          <div className="flex items-start gap-2 text-xs text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg p-2.5">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+            <span>
+              {gmailSuccess.type === "send"
+                ? `E-mail envoyé via Gmail à ${gmailSuccess.to} (${gmailSuccess.timestamp}). Prospect marqué comme contacté.`
+                : `Brouillon enregistré dans votre compte Gmail (${gmailSuccess.timestamp}).`}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Secondary / Fallback Actions */}
       <div className="flex flex-wrap items-center gap-2">
         <button
           type="button"
@@ -690,7 +1086,7 @@ export function ProspectEmailGenerator({
           className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-800 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0"
         >
           <Mail className="w-3.5 h-3.5 text-emerald-700" aria-hidden="true" />
-          <span>Ouvrir dans la messagerie</span>
+          <span>Messagerie locale</span>
         </a>
 
         <button
@@ -707,6 +1103,116 @@ export function ProspectEmailGenerator({
           <span>{alreadyContacted ? "Contacté" : "Marquer contacté"}</span>
         </button>
       </div>
+
+      {/* Explicit Confirmation Modal before mutating Gmail state */}
+      {pendingAction && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="gmail-confirm-title"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
+        >
+          <div className="w-full max-w-lg bg-white border border-slate-200 rounded-xl shadow-xl overflow-hidden">
+            <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between gap-3">
+              <h4
+                id="gmail-confirm-title"
+                className="font-display text-base font-bold text-slate-900"
+              >
+                {pendingAction === "send"
+                  ? "Confirmer l'envoi via Gmail"
+                  : "Confirmer la création du brouillon Gmail"}
+              </h4>
+              <button
+                type="button"
+                onClick={() => !isSendingGmail && setPendingAction(null)}
+                aria-label="Fermer la confirmation"
+                className="p-1.5 text-slate-500 hover:text-slate-900 rounded-lg"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-3 text-xs">
+              <p className="text-slate-600 leading-relaxed">
+                {pendingAction === "send"
+                  ? "Cet e-mail sera envoyé immédiatement depuis votre compte Gmail au destinataire ci-dessous."
+                  : "Ce message sera enregistré comme brouillon dans votre boîte Gmail sans être envoyé."}
+              </p>
+
+              <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-1.5">
+                <div className="flex gap-2">
+                  <span className="font-semibold text-slate-500 w-24 shrink-0">
+                    Expéditeur
+                  </span>
+                  <span className="text-slate-900 truncate">
+                    {user?.email || "Compte Google connecté"}
+                  </span>
+                </div>
+                <div className="flex gap-2">
+                  <span className="font-semibold text-slate-500 w-24 shrink-0">
+                    Destinataire
+                  </span>
+                  <span className="font-medium text-slate-900 truncate">
+                    {recipientEmail.trim() || "Non renseigné (brouillon)"}
+                  </span>
+                </div>
+                <div className="flex gap-2">
+                  <span className="font-semibold text-slate-500 w-24 shrink-0">
+                    Restaurant
+                  </span>
+                  <span className="text-slate-800 truncate">
+                    {lead.displayName}
+                  </span>
+                </div>
+                <div className="flex gap-2">
+                  <span className="font-semibold text-slate-500 w-24 shrink-0">
+                    Objet
+                  </span>
+                  <span className="font-semibold text-slate-900">
+                    {subject}
+                  </span>
+                </div>
+              </div>
+
+              <div className="max-h-48 overflow-y-auto bg-white border border-slate-200 rounded-lg p-3 text-slate-700 whitespace-pre-wrap leading-relaxed">
+                {body}
+              </div>
+            </div>
+
+            <div className="px-5 py-3.5 border-t border-slate-200 bg-slate-50 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setPendingAction(null)}
+                disabled={isSendingGmail}
+                className="px-3.5 py-2 text-xs font-medium text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg transition-colors whitespace-nowrap"
+              >
+                Annuler
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleConfirmGmailAction()}
+                disabled={isSendingGmail}
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap"
+              >
+                {isSendingGmail ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+                ) : pendingAction === "send" ? (
+                  <Send className="w-3.5 h-3.5" aria-hidden="true" />
+                ) : (
+                  <FileText className="w-3.5 h-3.5" aria-hidden="true" />
+                )}
+                <span>
+                  {isSendingGmail
+                    ? "Traitement…"
+                    : pendingAction === "send"
+                      ? "Confirmer et envoyer"
+                      : "Confirmer le brouillon"}
+                </span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 }
